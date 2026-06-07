@@ -107,34 +107,45 @@ PROMPT=$(mktemp)
 cd "$WORKTREE"
 BASE_SHA=$(git rev-parse HEAD)                 # capture BEFORE the run, for the quality reviewer
 
-timeout --signal=KILL "$BUDGET_SECONDS" \
-  pi -p --model "$LOCAL_MODEL" --thinking medium @"$PROMPT" \
+pkill -x pi 2>/dev/null                        # no stray implementer from a prior dispatch (see below)
+timeout -k 10 --signal=TERM "$BUDGET_SECONDS" \
+  pi -p --model "$LOCAL_MODEL" --thinking low @"$PROMPT" \
   > out.txt 2> err.txt
 rc=$?
 
-STATUS=$(grep -E '^STATUS:' out.txt | tail -1)
+# Tolerant parse: the model may emit a bare `STATUS: DONE` OR markdown `**Status:** DONE`
+# (the upstream Report Format uses the bold form). Match either, normalise to upper-case.
+STATUS=$(grep -ioE 'status:[*[:space:]]*(DONE_WITH_CONCERNS|NEEDS_CONTEXT|BLOCKED|DONE)' out.txt \
+         | grep -ioE 'DONE_WITH_CONCERNS|NEEDS_CONTEXT|BLOCKED|DONE' | tail -1 | tr a-z A-Z)
 HEAD_SHA=$(git rev-parse HEAD)                  # capture AFTER, for the quality reviewer
 ```
 
 - **`$LOCAL_MODEL`** — v1: `lmstudio/gemma-4-26b-a4b-it` (provider/id form; no `--provider`
   needed). Configured in `~/.pi/agent/models.json`.
-- **`$BUDGET_SECONDS`** — a generous per-task wall-clock cap (start ~600s; tune per plan).
+- **`$BUDGET_SECONDS`** — a generous per-task wall-clock cap (start ~300–600s; tune per plan).
   `pi -p` has **no internal timeout**, so this wrapper is mandatory.
-- **`--thinking medium`** — enough reasoning for mechanical implementation without the latency of
-  `xhigh`. Tune per task difficulty.
+- **`--signal=TERM` with `-k 10`, never bare `--signal=KILL`.** This is critical. A hard SIGKILL
+  severs pi mid-request and orphans **both** the pi process **and** the LM Studio server-side
+  generation; the orphaned generation then wedges the local model so every *subsequent* dispatch
+  hangs on its first inference (frozen, empty output) until you kill the strays. SIGTERM lets pi
+  abort the generation and clean up its children; `-k 10` is a 10s backstop if it ignores TERM.
+  The defensive `pkill -x pi` before each dispatch clears any orphan a previous run left behind.
+  (This was the single biggest failure mode in the e2e shakedown — see brief §11.)
+- **`--thinking low`** — proven fast and reliable for mechanical implementation on the local model.
+  `medium`/`xhigh` add latency for little gain here and are untested; tune up only if a task needs it.
 
-### Reading the result (spike-hardened — see brief §11)
+### Reading the result (spike + e2e hardened — see brief §11)
 
 - **Normal exit (`rc == 0`):** branch on `$STATUS` per "Handling Implementer Status" below.
-- **Timeout (`rc == 137` or `124`):** `pi -p` **buffers all stdout until exit**, so a killed run
-  yields empty `out.txt` even if work landed. **Do not trust stdout.** Inspect git instead:
-  `git -C "$WORKTREE" log --oneline "$BASE_SHA"..HEAD` and `git status`. If commits landed and
-  the tree is clean, salvage as `DONE_WITH_CONCERNS` and send to review (the reviewer is the real
-  gate). Otherwise treat as `BLOCKED` and re-dispatch once with a larger budget; if it times out
-  again, escalate.
-- **No `STATUS:` line on a clean exit:** treat as `DONE_WITH_CONCERNS` and proceed to review —
-  let the spec reviewer catch any gap. (Observed reliable so far, but never block the loop on a
-  missing line.)
+- **Timeout (`rc == 124`, or `143` if TERM-terminated):** `pi -p` **buffers all stdout until
+  exit**, so a killed run yields empty `out.txt` even if work landed. **Do not trust stdout.**
+  Inspect git instead: `git -C "$WORKTREE" log --oneline "$BASE_SHA"..HEAD` and `git status`. If
+  commits landed and the tree is clean, salvage as `DONE_WITH_CONCERNS` and send to review (the
+  reviewer is the real gate). Otherwise `pkill -x pi`, then treat as `BLOCKED` and re-dispatch once
+  with a larger budget; if it times out again, escalate. **A timeout is also your cue to clear
+  orphans before the next dispatch**, or it too will hang.
+- **No `STATUS:` match on a clean exit:** treat as `DONE_WITH_CONCERNS` and proceed to review —
+  let the spec reviewer catch any gap. Never block the loop on a missing/garbled status line.
 
 ### Fix loop — fresh session, never resume
 
@@ -148,8 +159,9 @@ chat memory:
 - `git -C "$WORKTREE" diff "$BASE_SHA"..HEAD` so it sees exactly what was built.
 - The same footer (it will read current files in the worktree directly).
 
-After the fix run commits, advance `HEAD_SHA` and re-review. The cwd worktree guarantees commits
-land on the task branch.
+Dispatch the fix run with the **same Invoking discipline** as above (`pkill -x pi` first,
+`--signal=TERM -k 10`, tolerant status parse). After it commits, advance `HEAD_SHA` and re-review.
+The cwd worktree guarantees commits land on the task branch.
 
 ### Convergence guard
 
@@ -217,6 +229,9 @@ Everything in the base skill's Red Flags applies. **Additionally, never:**
   Fixes are always fresh stateless runs.
 - **Run `pi -p` without a `timeout` wrapper** — it hangs indefinitely on model eviction and on the
   resume bug, with no error and no output.
+- **Hard-kill pi with `--signal=KILL`** — it orphans the LM Studio server-side generation and wedges
+  the local model for every following dispatch. Use `--signal=TERM -k 10`, and `pkill -x pi` to
+  clear any orphan before the next dispatch.
 - **Trust `out.txt` after a timeout** — stdout is buffered and lost on kill; judge progress from
   git state in the worktree.
 - **Route either reviewer to the local model** — review stays frontier.
